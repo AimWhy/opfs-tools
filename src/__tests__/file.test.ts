@@ -5,11 +5,11 @@ import { dir } from '../directory';
 const filePath = '/unit-test/file';
 
 beforeEach(async () => {
-  await file(filePath).remove();
+  await file(filePath).remove({ force: true });
 });
 
 afterEach(async () => {
-  await file(filePath).remove();
+  await file(filePath).remove({ force: true });
 });
 
 test('write string to file', async () => {
@@ -167,9 +167,10 @@ test('file exists', async () => {
 
 test('move file', async () => {
   await write(filePath, 'foo');
-  const target = await file(filePath).moveTo(dir('/'));
+  const root = dir('/');
+  await file(filePath).moveTo(root);
   expect(await file(filePath).exists()).toBe(false);
-  await target.remove();
+  await root.remove();
 });
 
 test('move file, current file not exists', async () => {
@@ -181,23 +182,92 @@ test('move file, current file not exists', async () => {
 test('copy file to dir', async () => {
   await write(filePath, 'foo');
   const oldFile = file(filePath);
-  const copyed = await oldFile.copyTo(dir('/'));
-  expect(copyed.path).toBe(`/${oldFile.name}`);
+  const root = dir('/');
+  await oldFile.copyTo(root);
+  const newFile = file(`/${oldFile.name}`);
+  expect(await newFile.exists()).toBe(true);
   expect(await oldFile.exists()).toBe(true);
 
-  await copyed.remove();
+  await newFile.remove();
 });
 
 test('copy file to another file', async () => {
   await write(filePath, 'foo');
   const oldFile = file(filePath);
-  let copyed = await oldFile.copyTo(file(filePath));
-  // selft
-  expect(copyed === oldFile).toBe(true);
 
-  copyed = await oldFile.copyTo(file('/abc'));
-  expect(copyed.path).toBe('/abc');
-  expect(await copyed.text()).toBe('foo');
+  const newFile = file('/abc');
+  await oldFile.copyTo(newFile);
+  expect(newFile.path).toBe('/abc');
+  expect(await newFile.text()).toBe('foo');
 
   await file('/abc').remove();
+});
+
+test('copy to file handle', async () => {
+  await write(filePath, 'foo');
+  const oldFile = file(filePath);
+  const newFileHandle = await (
+    await navigator.storage.getDirectory()
+  ).getFileHandle('bar', { create: true });
+
+  await oldFile.copyTo(newFileHandle);
+  expect(await (await newFileHandle.getFile()).text()).toBe('foo');
+  await file('/bar').remove();
+});
+
+test('close reader twice', async () => {
+  await write(filePath, 'foo');
+  const f = file(filePath);
+  const reader = await f.createReader();
+  await reader.close();
+  await reader.close();
+});
+
+test('multiple handler for single file', async () => {
+  const rwFile = file(filePath, 'rw');
+  const readOnlyFile1 = file(filePath, 'r');
+  const readOnlyFile2 = file(filePath, 'r');
+
+  await write(rwFile, '111');
+
+  expect(readOnlyFile1).not.toBe(readOnlyFile2);
+  expect(await readOnlyFile1.text()).toBe('111');
+  expect(await readOnlyFile2.text()).toBe('111');
+});
+
+test('read-only file dont write', async () => {
+  expect(async () => {
+    await write(file(filePath, 'r'), '111');
+  }).rejects.toThrowError('file is read-only');
+});
+
+test('unsafe write same file', async () => {
+  const f1 = file(filePath, 'rw-unsafe');
+  const f2 = file(filePath, 'rw-unsafe');
+  expect(f1.path).toBe(f2.path);
+  expect(f1).not.toBe(f2);
+
+  await write(f1, '111');
+  await write(f1, '222');
+
+  expect(await f2.text()).toBe('222');
+});
+
+test('remove file when unclos reader', async () => {
+  const f = file(filePath);
+  await write(f, '111');
+  const reader = await f.createReader();
+  expect(async () => {
+    await f.remove();
+  }).rejects.toThrowError('exists unclosed reader/writer');
+  await reader.close();
+  await f.remove();
+});
+
+test('force remove file', async () => {
+  const f = file(filePath);
+  await write(f, '111');
+  await f.createReader();
+  await f.remove({ force: true });
+  expect(await f.exists()).toBe(false);
 });

@@ -1,16 +1,23 @@
-import { OPFSWorkerAccessHandle, createOPFSAccess } from './access-worker';
+import {
+  OPFSWorkerAccessHandle,
+  OpenMode,
+  createOPFSAccess,
+} from './access-worker';
 import { getFSHandle, joinPath, parsePath, remove } from './common';
-import { OPFSDirWrap, dir } from './directory';
+import { OTDir, dir } from './directory';
 
-const fileCache = new Map<string, OPFSFileWrap>();
+const fileCache = new Map<string, OTFile>();
 /**
  * Retrieves a file wrapper instance for the specified file path.
  * @param {string} filePath - The path of the file.
- * return A file wrapper instance.
+ * @param {'r' | 'rw' | 'rw-unsafe'} mode - A string specifying the locking mode for the access handle. The default value is "rw"
+ * return A OTFile instance.
+ * 
+ * @see [MDN createSyncAccessHandle](https://developer.mozilla.org/en-US/docs/Web/API/FileSystemFileHandle/createSyncAccessHandle)
  * 
  * @example
  * // Read content from a file
-  const fileContent = await file('/path/to/file.txt').text();
+  const fileContent = await file('/path/to/file.txt', 'r').text();
   console.log('File content:', fileContent);
 
   // Check if a file exists
@@ -20,10 +27,13 @@ const fileCache = new Map<string, OPFSFileWrap>();
   // Remove a file
   await file('/path/to/file.txt').remove();
  */
-export function file(filePath: string) {
-  const f = fileCache.get(filePath) ?? new OPFSFileWrap(filePath);
-  fileCache.set(filePath, f);
-  return f;
+export function file(filePath: string, mode: ShortOpenMode = 'rw') {
+  if (mode === 'rw') {
+    const f = fileCache.get(filePath) ?? new OTFile(filePath, mode);
+    fileCache.set(filePath, f);
+    return f;
+  }
+  return new OTFile(filePath, mode);
 }
 
 /**
@@ -37,18 +47,18 @@ export function file(filePath: string) {
    await write('/path/to/file.txt', 'Hello, world!');
  */
 export async function write(
-  target: string | OPFSFileWrap,
-  content: string | BufferSource | ReadableStream<BufferSource> | OPFSFileWrap,
+  target: string | OTFile,
+  content: string | BufferSource | ReadableStream<BufferSource> | OTFile,
   opts = { overwrite: true }
 ) {
-  if (content instanceof OPFSFileWrap) {
+  if (content instanceof OTFile) {
     await write(target, await content.stream(), opts);
     return;
   }
 
-  const writer = await (target instanceof OPFSFileWrap
+  const writer = await (target instanceof OTFile
     ? target
-    : file(target)
+    : file(target, 'rw')
   ).createWriter();
   try {
     if (opts.overwrite) await writer.truncate(0);
@@ -69,10 +79,15 @@ export async function write(
   }
 }
 
+let FILE_ID = 0;
+const genFileId = () => ++FILE_ID;
+
+type ShortOpenMode = 'r' | 'rw' | 'rw-unsafe';
+
 /**
  * Represents a wrapper for interacting with a file in the filesystem.
  */
-export class OPFSFileWrap {
+export class OTFile {
   get kind(): 'file' {
     return 'file';
   }
@@ -90,17 +105,29 @@ export class OPFSFileWrap {
   }
 
   #path: string;
-  #parentPath: string | null;
+  #parentPath: string;
   #name: string;
+  #mode: OpenMode;
 
-  constructor(filePath: string) {
+  #id: number;
+  constructor(filePath: string, mode: ShortOpenMode) {
+    this.#id = genFileId();
     this.#path = filePath;
+    this.#mode = (
+      {
+        r: 'read-only',
+        rw: 'readwrite',
+        'rw-unsafe': 'readwrite-unsafe',
+      } as const
+    )[mode];
     const { parent, name } = parsePath(filePath);
+    if (parent == null) throw Error('Invalid path');
     this.#name = name;
     this.#parentPath = parent;
   }
 
   #referCnt = 0;
+  #unsafeClose = async () => {};
   #getAccessHandle = (() => {
     let accPromise: Promise<
       [OPFSWorkerAccessHandle, () => Promise<void>]
@@ -110,9 +137,21 @@ export class OPFSFileWrap {
       this.#referCnt += 1;
       if (accPromise != null) return accPromise;
 
-      return (accPromise = new Promise(async (resolve, reject) => {
+      accPromise = new Promise(async (resolve, reject) => {
         try {
-          const accHandle = await createOPFSAccess(this.#path);
+          const accHandle = await createOPFSAccess(
+            this.#id,
+            this.#path,
+            this.#mode
+          );
+
+          this.#unsafeClose = async () => {
+            if (accPromise == null) return;
+            accPromise = null;
+            this.#referCnt = 0;
+            await accHandle.close().catch(console.error);
+          };
+
           resolve([
             accHandle,
             async () => {
@@ -126,7 +165,8 @@ export class OPFSFileWrap {
         } catch (err) {
           reject(err);
         }
-      }));
+      });
+      return accPromise;
     };
   })();
 
@@ -135,43 +175,50 @@ export class OPFSFileWrap {
    * Random write to file
    */
   async createWriter() {
+    if (this.#mode === 'read-only') throw Error('file is read-only');
     if (this.#writing) throw Error('Other writer have not been closed');
     this.#writing = true;
 
-    const txtEC = new TextEncoder();
+    try {
+      const txtEC = new TextEncoder();
 
-    // append content by default
-    const [accHandle, unref] = await this.#getAccessHandle();
-    let pos = await accHandle.getSize();
-    let closed = false;
-    return {
-      write: async (
-        chunk: string | BufferSource,
-        opts: { at?: number } = {}
-      ) => {
-        if (closed) throw Error('Writer is closed');
-        const content = typeof chunk === 'string' ? txtEC.encode(chunk) : chunk;
-        const at = opts.at ?? pos;
-        const contentSize = content.byteLength;
-        pos = at + contentSize;
-        return await accHandle.write(content, { at });
-      },
-      truncate: async (size: number) => {
-        if (closed) throw Error('Writer is closed');
-        await accHandle.truncate(size);
-        if (pos > size) pos = size;
-      },
-      flush: async () => {
-        if (closed) throw Error('Writer is closed');
-        await accHandle.flush();
-      },
-      close: async () => {
-        if (closed) throw Error('Writer is closed');
-        closed = true;
-        this.#writing = false;
-        await unref();
-      },
-    };
+      // append content by default
+      const [accHandle, unref] = await this.#getAccessHandle();
+      let pos = await accHandle.getSize();
+      let closed = false;
+      return {
+        write: async (
+          chunk: string | BufferSource,
+          opts: { at?: number } = {}
+        ) => {
+          if (closed) throw Error('Writer is closed');
+          const content =
+            typeof chunk === 'string' ? txtEC.encode(chunk) : chunk;
+          const at = opts.at ?? pos;
+          const contentSize = content.byteLength;
+          pos = at + contentSize;
+          return await accHandle.write(content, { at });
+        },
+        truncate: async (size: number) => {
+          if (closed) throw Error('Writer is closed');
+          await accHandle.truncate(size);
+          if (pos > size) pos = size;
+        },
+        flush: async () => {
+          if (closed) throw Error('Writer is closed');
+          await accHandle.flush();
+        },
+        close: async () => {
+          if (closed) throw Error('Writer is closed');
+          closed = true;
+          this.#writing = false;
+          await unref();
+        },
+      };
+    } catch (err) {
+      this.#writing = false;
+      throw err;
+    }
   }
 
   /**
@@ -195,7 +242,7 @@ export class OPFSFileWrap {
         return await accHandle.getSize();
       },
       close: async () => {
-        if (closed) throw Error('Reader is closed');
+        if (closed) return;
         closed = true;
         await unref();
       },
@@ -213,15 +260,22 @@ export class OPFSFileWrap {
   }
 
   async stream() {
-    const fh = await getFSHandle(this.#path, { create: false, isFile: true });
-    if (fh == null) {
+    const ofile = await this.getOriginFile();
+    if (ofile == null) {
       return new ReadableStream<Uint8Array>({
         pull: (ctrl) => {
           ctrl.close();
         },
       });
     }
-    return (await fh.getFile()).stream();
+
+    return ofile.stream();
+  }
+
+  async getOriginFile() {
+    return (
+      await getFSHandle(this.#path, { create: false, isFile: true })
+    )?.getFile();
   }
 
   async getSize() {
@@ -239,28 +293,37 @@ export class OPFSFileWrap {
     );
   }
 
-  async remove() {
-    if (this.#referCnt) throw Error('exists unclosed reader/writer');
+  async remove(opts: { force?: boolean } = {}) {
+    if (opts.force === true) {
+      await this.#unsafeClose();
+      await remove(this.#path);
+      fileCache.delete(this.#path);
+      return;
+    }
+    if (this.#referCnt > 0) throw Error('exists unclosed reader/writer');
     await remove(this.#path);
-    // fileCache.delete(this.#path);
   }
 
   /**
    * If the target is a file, use current overwrite the target;
    * if the target is a folder, copy the current file into that folder.
    */
-  async copyTo(target: OPFSDirWrap | OPFSFileWrap): Promise<OPFSFileWrap> {
-    if (!(await this.exists())) {
-      throw Error(`file ${this.path} not exists`);
-    }
+  async copyTo(target: OTDir | OTFile): Promise<OTFile>;
+  async copyTo(target: FileSystemFileHandle): Promise<null>;
+  async copyTo<T>(target: T) {
+    if (target instanceof OTFile) {
+      if (target.path === this.path) return this;
 
-    if (target instanceof OPFSFileWrap) {
-      if (file(target.path) === this) return this;
-
-      await write(target.path, this);
-      return file(target.path);
-    } else if (target instanceof OPFSDirWrap) {
+      await write(target, this);
+      return target;
+    } else if (target instanceof OTDir) {
+      if (!(await this.exists())) {
+        throw Error(`file ${this.path} not exists`);
+      }
       return await this.copyTo(file(joinPath(target.path, this.name)));
+    } else if (target instanceof FileSystemFileHandle) {
+      await (await this.stream()).pipeTo(await target.createWritable());
+      return null;
     }
     throw Error('Illegal target type');
   }
@@ -268,7 +331,7 @@ export class OPFSFileWrap {
   /**
    * move file, copy then remove current
    */
-  async moveTo(target: OPFSDirWrap | OPFSFileWrap): Promise<OPFSFileWrap> {
+  async moveTo(target: OTDir | OTFile): Promise<OTFile> {
     const newFile = await this.copyTo(target);
     await this.remove();
     return newFile;

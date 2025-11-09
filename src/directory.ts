@@ -1,5 +1,5 @@
 import { getFSHandle, joinPath, parsePath, remove } from './common';
-import { file, OPFSFileWrap } from './file';
+import { file, OTFile } from './file';
 
 declare global {
   interface FileSystemDirectoryHandle {
@@ -28,10 +28,10 @@ declare global {
   const children = await dir('/path/to/parent_directory').children();
  */
 export function dir(dirPath: string) {
-  return new OPFSDirWrap(dirPath);
+  return new OTDir(dirPath);
 }
 
-export class OPFSDirWrap {
+export class OTDir {
   get kind(): 'dir' {
     return 'dir';
   }
@@ -44,7 +44,7 @@ export class OPFSDirWrap {
     return this.#path;
   }
 
-  get parent(): OPFSDirWrap | null {
+  get parent(): OTDir | null {
     return this.#parentPath == null ? null : dir(this.#parentPath);
   }
 
@@ -88,15 +88,26 @@ export class OPFSDirWrap {
    * Removes the directory.
    * return A promise that resolves when the directory is removed.
    */
-  async remove() {
-    await remove(this.#path);
+  async remove(opts: { force?: boolean } = {}) {
+    for (const it of await this.children()) {
+      try {
+        await it.remove(opts);
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+    try {
+      await remove(this.#path);
+    } catch (err) {
+      console.warn(err);
+    }
   }
 
   /**
    * Retrieves the children of the directory.
    * return A promise that resolves to an array of objects representing the children.
    */
-  async children(): Promise<Array<OPFSDirWrap | OPFSFileWrap>> {
+  async children(): Promise<Array<OTDir | OTFile>> {
     const handle = (await getFSHandle(this.#path, {
       create: false,
       isFile: false,
@@ -114,26 +125,47 @@ export class OPFSDirWrap {
    * If the dest folder exists, copy the current directory into the dest folder;
    * if the dest folder does not exist, rename the current directory to dest name.
    */
-  async copyTo(dest: OPFSDirWrap) {
+  async copyTo(dest: OTDir): Promise<OTDir>;
+  async copyTo(dest: FileSystemDirectoryHandle): Promise<null>;
+  async copyTo<T>(dest: T) {
     if (!(await this.exists())) {
       throw Error(`dir ${this.path} not exists`);
     }
-    const newDir = (await dest.exists())
-      ? dir(joinPath(dest.path, this.name))
-      : dest;
-    await newDir.create();
-    await Promise.all((await this.children()).map((it) => it.copyTo(newDir)));
 
-    return newDir;
+    if (dest instanceof OTDir) {
+      const newDir = (await dest.exists())
+        ? dir(joinPath(dest.path, this.name))
+        : dest;
+      await newDir.create();
+      await Promise.all((await this.children()).map((it) => it.copyTo(newDir)));
+      return newDir;
+    } else if (dest instanceof FileSystemDirectoryHandle) {
+      await Promise.all(
+        (
+          await this.children()
+        ).map(async (it) => {
+          if (it.kind === 'file') {
+            await it.copyTo(
+              await dest.getFileHandle(it.name, { create: true })
+            );
+          } else {
+            await it.copyTo(
+              await dest.getDirectoryHandle(it.name, { create: true })
+            );
+          }
+        })
+      );
+      return null;
+    }
+    throw Error('Illegal target type');
   }
 
   /**
    * move directory, copy then remove current
    */
-  async moveTo(dest: OPFSDirWrap): Promise<OPFSDirWrap> {
+  async moveTo(dest: OTDir): Promise<OTDir> {
     const newDir = await this.copyTo(dest);
     await this.remove();
-
     return newDir;
   }
 }
